@@ -17,7 +17,7 @@ const io = new Server(server, {
 
 app.set('trust proxy', 1);
 
-// ---------- Embedded HTML ----------
+// ---------- Full HTML (embedded) ----------
 const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -80,13 +80,9 @@ const html = `<!DOCTYPE html>
     <div id="fileSection">
       <div class="file-label">Upload File to Client(s)</div>
       <br>
-      <div class="file-row">
-        <input type="file" id="uploadFileInput" />
-      </div>
+      <div class="file-row"><input type="file" id="uploadFileInput" /></div>
       <br>
-      <div class="file-row">
-        <button id="uploadBtn" class="file-btn file-btn-small" style="width:100%">Upload</button>
-      </div>
+      <div class="file-row"><button id="uploadBtn" class="file-btn file-btn-small" style="width:100%">Upload</button></div>
       <br>
       <div class="file-label" style="margin-top:4px">Download File from Client</div>
       <br>
@@ -438,18 +434,12 @@ const html = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// ---------- Serve HTML at root AND /master AND /:uuid ----------
-app.get('/', (req, res) => {
-  res.send(html);
-});
-app.get('/master', (req, res) => {
-  res.send(html);
-});
-app.get('/:uuid', (req, res) => {
-  res.send(html);
-});
+// ---------- Routes ----------
+app.get('/', (req, res) => res.send(html));
+app.get('/master', (req, res) => res.send(html));
+app.get('/:uuid', (req, res) => res.send(html));
 
-// ---------- Socket.IO Handlers ----------
+// ---------- Socket.IO Logic ----------
 const clients = new Map();
 const viewers = new Map();
 const masters = new Set();
@@ -459,12 +449,14 @@ io.on('connection', (socket) => {
   let role = null;
   let clientId = null;
 
+  // Heartbeat
   socket.on('heartbeat', () => {
     if (clientId && clientHeartbeats.has(clientId)) {
       clientHeartbeats.set(clientId, Date.now());
     }
   });
 
+  // Register client
   socket.on('register-client', (oldId) => {
     role = 'client';
     const connectionEpoch = Date.now();
@@ -534,7 +526,7 @@ io.on('connection', (socket) => {
       socket.emit('command', cmd);
     });
 
-    // File transfer events
+    // ---- File transfer events ----
     socket.on('file-download-start', (meta) => {
       const set = viewers.get(clientId);
       if (set) set.forEach(s => s.emit('download-start', meta));
@@ -572,6 +564,7 @@ io.on('connection', (socket) => {
     });
   });
 
+  // Viewer
   socket.on('register-viewer', (id) => {
     role = 'viewer';
     clientId = id;
@@ -613,6 +606,7 @@ io.on('connection', (socket) => {
     });
   });
 
+  // Master
   socket.on('register-master', () => {
     role = 'master';
     masters.add(socket);
@@ -673,6 +667,7 @@ io.on('connection', (socket) => {
         });
       }
     });
+
     socket.on('download-request', (data) => {
       if (data.targets === null || data.targets.length === 0) {
         const firstEntry = clients.entries().next().value;
@@ -698,6 +693,7 @@ io.on('connection', (socket) => {
     });
   });
 
+  // Targeted command
   socket.on('targeted-command', ({ uuids, cmd }) => {
     if (!Array.isArray(uuids) || typeof cmd !== 'string' || cmd.trim() === '') {
       socket.emit('system', '[System] Invalid targeted command payload');
