@@ -13,27 +13,19 @@ if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 if (!fs.existsSync('downloads')) fs.mkdirSync('downloads');
 
 // ---------- State ----------
-const clients = new Map(); // clientId -> { cwd, env, tasks, lastTaskId, connected, pendingDownload, lastSeen }
-const clientHistory = new Map(); // clientId -> [{ timestamp, output }]
+const clients = new Map();
+const clientHistory = new Map();
 let latestCommand = { id: 0, cmd: '' };
 const selectedInclude = new Set();
 const selectedExclude = new Set();
 
 // ---------- Constants ----------
-const DISCONNECT_THRESHOLD = 10000; // 10 seconds
+const DISCONNECT_THRESHOLD = 10000;
 
 // ---------- Helper ----------
-function getTargetClients(targets) {
-  if (!targets || targets.length === 0) {
-    return Array.from(clients.keys());
-  }
-  return targets.filter(id => clients.has(id));
-}
-
 function getClientStatus(client) {
   if (!client.lastSeen) return 'unknown';
-  const elapsed = Date.now() - client.lastSeen;
-  return elapsed > DISCONNECT_THRESHOLD ? 'disconnected' : 'connected';
+  return Date.now() - client.lastSeen > DISCONNECT_THRESHOLD ? 'disconnected' : 'connected';
 }
 
 // ---------- Embedded HTML ----------
@@ -55,7 +47,7 @@ const html = `<!DOCTYPE html>
     .system { color: #3af; }
     .command { color: #5f5; }
     .lineCheckbox { margin-top: 2px; cursor: pointer; }
-    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; flex-shrink: 0; }
     .status-connected { background: #0f0; }
     .status-disconnected { background: #f55; }
     ::-webkit-scrollbar { width: 8px; }
@@ -130,7 +122,7 @@ const html = `<!DOCTYPE html>
     <input type="text" id="cmd" autocomplete="off" spellcheck="false" placeholder="Type command..." autofocus />
   </div>
   <script>
-    // ---------- HTTP-based UI ----------
+    // ---------- HTTP-based UI with history ----------
     const terminal = document.getElementById('terminal');
     const input = document.getElementById('cmd');
     const selectedUUIDs = new Set();
@@ -139,7 +131,8 @@ const html = `<!DOCTYPE html>
     let commandHistory = [];
     let historyIndex = -1;
     let lastCtrlClickedCheckbox = null;
-    let allClients = [];
+    // Store all terminal lines as DOM elements
+    const terminalLines = [];
 
     // Radio buttons
     document.querySelectorAll('input[name="selMode"]').forEach(radio => {
@@ -186,16 +179,23 @@ const html = `<!DOCTYPE html>
       }
     }
 
-    function makeLineElement(text, cls) {
+    // Build a line element with checkbox and status dot
+    function buildLineElement(client, cls) {
       const wrapper = document.createElement('div');
       wrapper.className = 'output';
       if (cls) wrapper.classList.add(cls);
-      const uuidMatch = text.match(/^\\[([0-9a-fA-F-]{8,36})\\]/);
+
+      // Status dot
+      const dot = document.createElement('span');
+      dot.className = 'status-dot ' + (client.status === 'connected' ? 'status-connected' : 'status-disconnected');
+      wrapper.appendChild(dot);
+
+      // Checkbox
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
       checkbox.className = 'lineCheckbox';
-      if (uuidMatch) {
-        checkbox.dataset.uuid = uuidMatch[1];
+      if (client.id) {
+        checkbox.dataset.uuid = client.id;
         checkbox.disabled = (selectionMode === 'none');
         checkbox.addEventListener('change', (e) => {
           const id = e.target.dataset.uuid;
@@ -236,16 +236,21 @@ const html = `<!DOCTYPE html>
         checkbox.disabled = true;
         checkbox.title = 'No UUID on this line';
       }
-      const textDiv = document.createElement('div');
-      textDiv.textContent = text;
       wrapper.appendChild(checkbox);
+
+      // Text content
+      const textDiv = document.createElement('div');
+      const displayText = '[' + client.id + '] ' + (client.cwd || '/') + ' > ' + (client.output || 'No output');
+      textDiv.textContent = displayText;
       wrapper.appendChild(textDiv);
+
       return wrapper;
     }
 
-    function appendLine(text, cls) {
-      const el = makeLineElement(text, cls);
+    function appendLine(client, cls) {
+      const el = buildLineElement(client, cls);
       terminal.appendChild(el);
+      terminalLines.push(el);
       terminal.scrollTop = terminal.scrollHeight;
     }
 
@@ -260,19 +265,50 @@ const html = `<!DOCTYPE html>
       document.getElementById('fileProgress').style.display = 'none';
     }
 
+    // Fetch clients and append new lines (do not clear)
     async function fetchClients() {
       try {
         const res = await fetch('/clients');
         const data = await res.json();
-        allClients = data.clients;
-        terminal.innerHTML = '';
+        // For each client, check if we already have a line for its ID in the terminal.
+        // We'll store the mapping from client ID to the line element (or its index).
+        // A simple approach: clear all lines and rebuild from history?
+        // But we want to keep history. Instead, we'll append new lines for new client states.
+        // But the user wants a scrolling history of all command outputs, not just client status.
+        // Actually we want to show a history of commands and responses.
+        // However, the server only returns the latest output per client.
+        // To get history, we'd need the server to return the full history.
+        // But the server already maintains clientHistory per client with timestamps.
+        // We can fetch that and display it.
+        // But for simplicity, we'll just append new client updates as they come.
+        // But we need to avoid duplicate lines if a client updates multiple times.
+        // Instead, we can clear terminal and rebuild from history if we have it.
+        // Let's fetch the full history from the server? 
+        // The current server sends only the last output. We could change the server to send the full history for each client.
+        // But the user wants a scrollable terminal like a real terminal.
+        // The simplest fix: when we fetch clients, clear the terminal and rebuild from the history array.
+        // But we don't have the full history in the response. We only have the last output per client.
+        // To fix properly, we need to store the full log in the server and send it to the UI.
+        // Let's modify the server to include the history in /clients.
+        // But we can also just append updates without clearing, and let the terminal grow.
+        // The issue is that every time we fetch, we append new lines, causing duplicates.
+        // We can keep a set of seen outputs per client and only append when output changes.
+        // Let's implement that: store lastOutput per client and only append when it changes.
+
+        // We'll store last known output per client id in a Map.
+        if (!window.lastKnownOutputs) window.lastKnownOutputs = new Map();
+
         for (const client of data.clients) {
-          const statusClass = client.status === 'connected' ? 'status-connected' : 'status-disconnected';
-          const statusDot = '<span class="status-dot ' + statusClass + '"></span>';
-          const text = statusDot + '[' + client.id + '] ' + (client.cwd || '/') + ' > ' + (client.output || 'No output');
-          const cls = client.output && client.output.toLowerCase().includes('error') ? 'error' : '';
-          appendLine(text, cls);
+          const last = window.lastKnownOutputs.get(client.id);
+          const current = client.output || '';
+          if (last !== current) {
+            // Append new line
+            const cls = client.output && client.output.toLowerCase().includes('error') ? 'error' : '';
+            appendLine(client, cls);
+            window.lastKnownOutputs.set(client.id, current);
+          }
         }
+        // Also update title
         if (data.clients.length > 0 && data.clients[0].cwd) {
           document.title = 'Remote Terminal - ' + data.clients[0].cwd;
         }
@@ -292,9 +328,22 @@ const html = `<!DOCTYPE html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        appendLine('> ' + cmd, 'command');
+        // Add a command line to terminal (without checkbox)
+        const cmdWrapper = document.createElement('div');
+        cmdWrapper.className = 'output command';
+        const cmdText = document.createElement('div');
+        cmdText.textContent = '> ' + cmd;
+        cmdWrapper.appendChild(cmdText);
+        terminal.appendChild(cmdWrapper);
+        terminal.scrollTop = terminal.scrollHeight;
       } catch (e) {
-        appendLine('[Error] Failed to send command', 'error');
+        const errWrapper = document.createElement('div');
+        errWrapper.className = 'output error';
+        const errText = document.createElement('div');
+        errText.textContent = '[Error] Failed to send command';
+        errWrapper.appendChild(errText);
+        terminal.appendChild(errWrapper);
+        terminal.scrollTop = terminal.scrollHeight;
       }
     }
 
@@ -331,7 +380,13 @@ const html = `<!DOCTYPE html>
     document.getElementById('uploadBtn').addEventListener('click', async () => {
       const fileInput = document.getElementById('uploadFileInput');
       if (!fileInput.files || fileInput.files.length === 0) {
-        appendLine('[System] No file selected for upload', 'error');
+        const errWrapper = document.createElement('div');
+        errWrapper.className = 'output error';
+        const errText = document.createElement('div');
+        errText.textContent = '[System] No file selected for upload';
+        errWrapper.appendChild(errText);
+        terminal.appendChild(errWrapper);
+        terminal.scrollTop = terminal.scrollHeight;
         return;
       }
       const file = fileInput.files[0];
@@ -342,13 +397,22 @@ const html = `<!DOCTYPE html>
       try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const result = await res.json();
-        if (result.ok) {
-          appendLine('[System] Uploaded ' + file.name + ' to client(s)', 'system');
-        } else {
-          appendLine('[System] Upload failed: ' + (result.error || 'unknown error'), 'error');
-        }
+        const msg = result.ok ? '[System] Uploaded ' + file.name + ' to client(s)' : '[System] Upload failed: ' + (result.error || 'unknown error');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'output system';
+        const text = document.createElement('div');
+        text.textContent = msg;
+        wrapper.appendChild(text);
+        terminal.appendChild(wrapper);
+        terminal.scrollTop = terminal.scrollHeight;
       } catch (e) {
-        appendLine('[System] Upload error: ' + e.message, 'error');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'output error';
+        const text = document.createElement('div');
+        text.textContent = '[System] Upload error: ' + e.message;
+        wrapper.appendChild(text);
+        terminal.appendChild(wrapper);
+        terminal.scrollTop = terminal.scrollHeight;
       }
     });
 
@@ -356,7 +420,13 @@ const html = `<!DOCTYPE html>
     document.getElementById('downloadBtn').addEventListener('click', async () => {
       const remotePath = document.getElementById('downloadPath').value.trim();
       if (!remotePath) {
-        appendLine('[System] No remote path specified for download', 'error');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'output error';
+        const text = document.createElement('div');
+        text.textContent = '[System] No remote path specified for download';
+        wrapper.appendChild(text);
+        terminal.appendChild(wrapper);
+        terminal.scrollTop = terminal.scrollHeight;
         return;
       }
       const targets = getTargetUUIDs();
@@ -369,13 +439,22 @@ const html = `<!DOCTYPE html>
           body: JSON.stringify(payload)
         });
         const result = await res.json();
-        if (result.ok) {
-          appendLine('[System] Download requested for ' + remotePath, 'system');
-        } else {
-          appendLine('[System] Download failed: ' + (result.error || 'unknown error'), 'error');
-        }
+        const msg = result.ok ? '[System] Download requested for ' + remotePath : '[System] Download failed: ' + (result.error || 'unknown error');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'output system';
+        const text = document.createElement('div');
+        text.textContent = msg;
+        wrapper.appendChild(text);
+        terminal.appendChild(wrapper);
+        terminal.scrollTop = terminal.scrollHeight;
       } catch (e) {
-        appendLine('[System] Download error: ' + e.message, 'error');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'output error';
+        const text = document.createElement('div');
+        text.textContent = '[System] Download error: ' + e.message;
+        wrapper.appendChild(text);
+        terminal.appendChild(wrapper);
+        terminal.scrollTop = terminal.scrollHeight;
       }
     });
 
@@ -391,18 +470,19 @@ const html = `<!DOCTYPE html>
     // Init
     document.querySelectorAll('.lineCheckbox').forEach(cb => { cb.disabled = true; });
     updateSelectedList();
-    setInterval(fetchClients, 1000);
+    // Initial fetch
     fetchClients();
+    // Poll every 2 seconds to reduce noise
+    setInterval(fetchClients, 2000);
   </script>
 </body>
 </html>`;
 
-// ---------- Routes ----------
-// HTML routes (specific paths first)
+// ---------- Routes (order matters) ----------
 app.get('/', (req, res) => res.send(html));
 app.get('/master', (req, res) => res.send(html));
 
-// ---------- API routes (MUST COME BEFORE /:uuid) ----------
+// ---------- API routes ----------
 app.post('/register', (req, res) => {
   const clientId = uuidv4();
   clients.set(clientId, {
@@ -470,8 +550,7 @@ app.get('/clients', (req, res) => {
       id,
       output: lastOutput,
       cwd: client.cwd || '/',
-      status,
-      history: history.slice(-10)
+      status
     });
   }
   res.json({ clients: list });
@@ -526,7 +605,7 @@ app.use('/downloads', express.static('downloads'));
 // ---------- Catch-all for viewer mode (MUST BE LAST) ----------
 app.get('/:uuid', (req, res) => res.send(html));
 
-// ---------- Start server ----------
+// ---------- Start ----------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
   console.log('HTTP Server running on port ' + PORT);
